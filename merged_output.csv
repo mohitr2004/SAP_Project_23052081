@@ -1,0 +1,7 @@
+user_id,name,email,age,city
+1,Alice Johnson,alice@example.com,29,New York
+2,Bob Smith,bob@example.com,34,Los Angeles
+3,Carol White,,28,Chicago
+4,David Brown,david@example.com,,Houston
+5,Eva Green,eva@example.com,22,Phoenix
+2,Bob Smith,bob@example.com,34,Los Angeles

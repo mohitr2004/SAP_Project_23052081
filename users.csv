@@ -1,0 +1,7 @@
+order_id,user_id,product_id,quantity,amount,status
+101,1,501,2,49.99,delivered
+102,2,502,,19.99,pending
+103,3,503,1,,shipped
+104,4,501,3,74.97,delivered
+105,5,504,1,9.99,cancelled
+106,1,502,2,39.98,delivered

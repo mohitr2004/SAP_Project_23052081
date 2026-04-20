@@ -1,0 +1,310 @@
+﻿"""
+csv_pipeline.py
+~~~~~~~~~~~~~~~
+Production-grade CSV ingestion, cleaning, and merge pipeline.
+
+Usage:
+    python csv_pipeline.py --config pipeline_config.json
+    python csv_pipeline.py --input-dir ./data --output merged_output.csv
+    python csv_pipeline.py --input-dir ./data --output merged_output.csv --drop-threshold 0.5
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+import pandas as pd
+
+# ---------------------------------------------------------------------------
+# Logging setup
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("pipeline.log", mode="a"),
+    ],
+)
+logger = logging.getLogger("csv_pipeline")
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PipelineConfig:
+    """All tunable knobs for the pipeline — config-file or CLI driven."""
+
+    input_dir: Path
+    output_path: Path
+
+    drop_threshold: float = 0.5
+    fill_strategy: str = "median"
+    deduplicate: bool = True
+
+    merge_how: str = "outer"
+    join_keys: list[str] = field(default_factory=list)
+
+    encoding: str = "utf-8"
+    glob_pattern: str = "*.csv"
+
+    @classmethod
+    def from_json(cls, path: Path) -> "PipelineConfig":
+        try:
+            text = path.read_text(encoding='utf-8')
+        except UnicodeDecodeError:
+            text = path.read_text(encoding='utf-16')
+        # Take the first JSON object
+        start = text.find('{')
+        end = text.find('}', start) + 1
+        raw = json.loads(text[start:end])
+        raw["input_dir"] = Path(raw["input_dir"])
+        raw["output_path"] = Path(raw["output_path"])
+        return cls(**raw)
+
+    @classmethod
+    def from_args(cls, args: argparse.Namespace) -> "PipelineConfig":
+        return cls(
+            input_dir=Path(args.input_dir),
+            output_path=Path(args.output),
+            drop_threshold=args.drop_threshold,
+            fill_strategy=args.fill_strategy,
+            deduplicate=not args.no_dedup,
+            merge_how=args.merge_how,
+            join_keys=args.join_keys or [],
+        )
+
+
+# ---------------------------------------------------------------------------
+# Pipeline stages
+# ---------------------------------------------------------------------------
+
+class CSVLoader:
+    """Discovers and loads CSV files from a directory."""
+
+    def __init__(self, config: PipelineConfig) -> None:
+        self.config = config
+
+    def load(self) -> dict[str, pd.DataFrame]:
+        paths = sorted(self.config.input_dir.glob(self.config.glob_pattern))
+        if not paths:
+            raise FileNotFoundError(
+                f"No CSVs found in '{self.config.input_dir}' "
+                f"matching '{self.config.glob_pattern}'"
+            )
+
+        frames: dict[str, pd.DataFrame] = {}
+        for p in paths:
+            t0 = time.perf_counter()
+            try:
+                df = pd.read_csv(p, encoding=self.config.encoding)
+                elapsed = time.perf_counter() - t0
+                logger.info(
+                    "Loaded %-40s  rows=%-8d cols=%-4d  (%.3fs)",
+                    p.name, len(df), len(df.columns), elapsed,
+                )
+                frames[p.stem] = df
+            except Exception as exc:
+                logger.error("Failed to load '%s': %s", p, exc)
+                raise
+
+        return frames
+
+
+class DataCleaner:
+    """Cleans a single DataFrame: drops sparse columns, imputes, deduplicates."""
+
+    def __init__(self, config: PipelineConfig) -> None:
+        self.config = config
+
+    def clean(self, df: pd.DataFrame, name: str = "") -> pd.DataFrame:
+        label = f"[{name}]" if name else ""
+        original_shape = df.shape
+
+        df = self._drop_sparse_columns(df, label)
+        df = self._impute(df, label)
+        if self.config.deduplicate:
+            df = self._deduplicate(df, label)
+
+        logger.info(
+            "%s Cleaning complete: %s -> %s", label, original_shape, df.shape
+        )
+        return df
+
+    def _drop_sparse_columns(self, df: pd.DataFrame, label: str) -> pd.DataFrame:
+        missing_frac = df.isnull().mean()
+        to_drop = missing_frac[missing_frac > self.config.drop_threshold].index.tolist()
+        if to_drop:
+            logger.warning(
+                "%s Dropping %d high-null column(s): %s", label, len(to_drop), to_drop
+            )
+            df = df.drop(columns=to_drop)
+        return df
+
+    def _impute(self, df: pd.DataFrame, label: str) -> pd.DataFrame:
+        strategy = self.config.fill_strategy
+        null_counts_before = df.isnull().sum().sum()
+
+        if strategy == "drop":
+            df = df.dropna()
+        elif strategy == "ffill":
+            df = df.ffill()
+        elif strategy == "bfill":
+            df = df.bfill()
+        else:
+            numeric_cols = df.select_dtypes(include="number").columns
+            cat_cols = df.select_dtypes(include="object").columns
+
+            for col in numeric_cols:
+                if df[col].isnull().any():
+                    fill_val = (
+                        df[col].median() if strategy == "median" else df[col].mean()
+                    )
+                    df[col] = df[col].fillna(fill_val)
+
+            for col in cat_cols:
+                if df[col].isnull().any():
+                    mode_vals = df[col].mode()
+                    if not mode_vals.empty:
+                        df[col] = df[col].fillna(mode_vals.iloc[0])
+
+        null_counts_after = df.isnull().sum().sum()
+        logger.info(
+            "%s Imputed %d nulls via strategy='%s'",
+            label, null_counts_before - null_counts_after, strategy,
+        )
+        return df
+
+    def _deduplicate(self, df: pd.DataFrame, label: str) -> pd.DataFrame:
+        before = len(df)
+        df = df.drop_duplicates()
+        removed = before - len(df)
+        if removed:
+            logger.info("%s Removed %d duplicate row(s)", label, removed)
+        return df
+
+
+class DataMerger:
+    """Merges multiple DataFrames — join on keys or a simple concat."""
+
+    def __init__(self, config: PipelineConfig) -> None:
+        self.config = config
+
+    def merge(self, frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
+        dfs = list(frames.values())
+
+        if not self.config.join_keys:
+            logger.info("No join keys specified — concatenating %d frame(s)", len(dfs))
+            result = pd.concat(dfs, ignore_index=True, sort=False)
+        else:
+            logger.info(
+                "Joining %d frame(s) on keys=%s how='%s'",
+                len(dfs), self.config.join_keys, self.config.merge_how,
+            )
+            result = dfs[0]
+            for df in dfs[1:]:
+                result = result.merge(
+                    df,
+                    on=self.config.join_keys,
+                    how=self.config.merge_how,
+                    suffixes=("_left", "_right"),
+                )
+
+        logger.info("Merged result: rows=%d  cols=%d", *result.shape)
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Pipeline orchestrator
+# ---------------------------------------------------------------------------
+
+class Pipeline:
+    """Wires loader -> cleaner -> merger -> writer."""
+
+    def __init__(self, config: PipelineConfig) -> None:
+        self.config = config
+        self.loader  = CSVLoader(config)
+        self.cleaner = DataCleaner(config)
+        self.merger  = DataMerger(config)
+
+    def run(self) -> pd.DataFrame:
+        t_start = time.perf_counter()
+        logger.info("=" * 60)
+        logger.info("Pipeline starting")
+        logger.info("  input_dir     : %s", self.config.input_dir)
+        logger.info("  output_path   : %s", self.config.output_path)
+        logger.info("  fill_strategy : %s", self.config.fill_strategy)
+        logger.info("  drop_threshold: %.0f%%", self.config.drop_threshold * 100)
+        logger.info("=" * 60)
+
+        raw_frames   = self.loader.load()
+        clean_frames = {
+            name: self.cleaner.clean(df, name=name)
+            for name, df in raw_frames.items()
+        }
+        result = self.merger.merge(clean_frames)
+        self._write(result)
+
+        elapsed = time.perf_counter() - t_start
+        logger.info("Pipeline finished in %.2fs", elapsed)
+        return result
+
+    def _write(self, df: pd.DataFrame) -> None:
+        self.config.output_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(self.config.output_path, index=False, encoding=self.config.encoding)
+        logger.info("Output written -> %s", self.config.output_path)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Production CSV ingestion, cleaning, and merge pipeline.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--config", type=Path, help="JSON config file path")
+    group.add_argument("--input-dir", type=str, help="Directory containing CSVs")
+
+    p.add_argument("--output",          default="merged_output.csv")
+    p.add_argument("--drop-threshold",  type=float, default=0.5)
+    p.add_argument("--fill-strategy",   default="median",
+                   choices=["median", "mean", "mode", "ffill", "bfill", "drop"])
+    p.add_argument("--no-dedup",        action="store_true")
+    p.add_argument("--merge-how",       default="outer",
+                   choices=["inner", "outer", "left", "right"])
+    p.add_argument("--join-keys",       nargs="*")
+    return p
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    try:
+        config = (
+            PipelineConfig.from_json(args.config)
+            if args.config
+            else PipelineConfig.from_args(args)
+        )
+        Pipeline(config).run()
+    except Exception:
+        logger.exception("Pipeline failed")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
